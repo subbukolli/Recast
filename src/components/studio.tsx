@@ -6,11 +6,14 @@ import {
   ImagePlus,
   Link2,
   Loader2,
+  Search,
   ShieldCheck,
 } from "lucide-react";
 import { linkBlock } from "@/lib/faceswap/links";
 import { clipSpan, MAX_SECONDS, type Quality } from "@/lib/faceswap/geometry";
-import { fileToCanvas, recastClip, renderStill } from "@/lib/faceswap/pipeline";
+import { frameIndexAt, sliceGif, MAX_GIF_SECONDS, decodeGif, type GifClip } from "@/lib/faceswap/gif";
+import { fileToCanvas, recastClip, recastGif, renderGifStill, renderStill } from "@/lib/faceswap/pipeline";
+import { searchTenor, type TenorHit } from "@/lib/faceswap/tenor-search";
 
 function clock(seconds: number) {
   const safe = Math.max(0, seconds);
@@ -33,13 +36,19 @@ export function Studio() {
   const sourceRef = useRef<HTMLVideoElement>(null);
   const resultRef = useRef<HTMLVideoElement>(null);
   const stageRef = useRef<HTMLCanvasElement>(null);
+  const gifViewRef = useRef<HTMLCanvasElement>(null);
   const fileRef = useRef<File | null>(null);
+  const gifRef = useRef<GifClip | null>(null);
   const photoRef = useRef<HTMLCanvasElement | null>(null);
   const clipUrl = useRef<string | null>(null);
   const previewAbort = useRef<AbortController | null>(null);
   const recastAbort = useRef<AbortController | null>(null);
+  const tenorOnce = useRef(false);
 
   const [clipName, setClipName] = useState<string | null>(null);
+  const [gifName, setGifName] = useState<string | null>(null);
+  const [gifDelays, setGifDelays] = useState<number[]>([]);
+  const [mode, setMode] = useState<"reel" | "gif">("reel");
   const [photoName, setPhotoName] = useState<string | null>(null);
   const [photoToken, setPhotoToken] = useState("0");
   const [mediaTick, setMediaTick] = useState(0);
@@ -52,17 +61,22 @@ export function Studio() {
   const [note, setNote] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [link, setLink] = useState("");
+  const [tenorQ, setTenorQ] = useState("");
+  const [tenorHits, setTenorHits] = useState<TenorHit[]>([]);
+  const [tenorBusy, setTenorBusy] = useState(false);
+  const [tenorPick, setTenorPick] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [hasPreview, setHasPreview] = useState(false);
   const [holding, setHolding] = useState(false);
   const [run, setRun] = useState<{ done: number; total: number; label: string } | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [resultName, setResultName] = useState("recast.mp4");
+  const [resultKind, setResultKind] = useState<"video" | "gif">("video");
 
   const running = run !== null;
-  const span = clipSpan(duration, start);
 
   useEffect(() => {
+    if (mode !== "reel") return;
     const photo = photoRef.current;
     const video = sourceRef.current;
     const output = stageRef.current;
@@ -107,7 +121,88 @@ export function Studio() {
       ac.abort();
       window.clearTimeout(timer);
     };
-  }, [clipName, duration, flip, follow, lighting, mediaTick, photoToken, quality, start]);
+  }, [clipName, duration, flip, follow, lighting, mediaTick, mode, photoToken, quality, start]);
+
+  useEffect(() => {
+    if (mode !== "gif") return;
+    const photo = photoRef.current;
+    const gif = gifRef.current;
+    const output = stageRef.current;
+    if (!photo || !gif || !output || !gifName || !gif.frames.length) return;
+    const ac = new AbortController();
+    previewAbort.current = ac;
+    let alive = true;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        setBusy("Fitting your face…");
+        try {
+          const frame = gif.frames[frameIndexAt(gif.delays, start * 1000)];
+          if (!frame) return;
+          const found = await renderGifStill({
+            frame,
+            photo,
+            photoToken,
+            flip,
+            follow: follow / 100,
+            lighting,
+            quality,
+            output,
+            signal: ac.signal,
+          });
+          if (!alive || ac.signal.aborted) return;
+          setHasPreview(true);
+          setResultUrl((prev) => {
+            if (prev) URL.revokeObjectURL(prev);
+            return null;
+          });
+          setNote(found === "face" ? null : "No face in this frame. Nudge the start time.");
+        } catch (error) {
+          if (!alive || ac.signal.aborted || isAbort(error)) return;
+          setHasPreview(false);
+          setNote(messageOf(error));
+        } finally {
+          if (alive && !ac.signal.aborted) setBusy(null);
+        }
+      })();
+    }, 220);
+    return () => {
+      alive = false;
+      ac.abort();
+      window.clearTimeout(timer);
+    };
+  }, [flip, follow, gifName, lighting, mediaTick, mode, photoToken, quality, start]);
+
+  useEffect(() => {
+    if (mode !== "gif" || !gifName) return;
+    const gif = gifRef.current;
+    const view = gifViewRef.current;
+    if (!gif || !view) return;
+    const frame = gif.frames[frameIndexAt(gif.delays, start * 1000)];
+    if (!frame) return;
+    view.width = frame.width;
+    view.height = frame.height;
+    view.getContext("2d")?.drawImage(frame, 0, 0);
+  }, [gifName, mediaTick, mode, start]);
+
+  useEffect(() => {
+    if (mode !== "gif" || tenorOnce.current) return;
+    tenorOnce.current = true;
+    let alive = true;
+    setTenorBusy(true);
+    void searchTenor({ data: { q: "" } })
+      .then((hits) => {
+        if (alive) setTenorHits(hits);
+      })
+      .catch((error: unknown) => {
+        if (alive) setNote(messageOf(error));
+      })
+      .finally(() => {
+        if (alive) setTenorBusy(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [mode]);
 
   useEffect(() => {
     return () => {
@@ -115,7 +210,7 @@ export function Studio() {
     };
   }, []);
 
-  async function useClip(file: File) {
+  async function loadClip(file: File) {
     const el = sourceRef.current;
     if (!el) return;
     if (!file.type.startsWith("video/") && !/\.(mp4|webm|mov|m4v)$/i.test(file.name)) {
@@ -164,7 +259,79 @@ export function Studio() {
     }
   }
 
-  async function usePhoto(file: File) {
+  async function loadGif(file: File) {
+    if (file.type !== "image/gif" && !/\.gif$/i.test(file.name)) {
+      setNote("Drop a GIF file.");
+      return;
+    }
+    setBusy("Reading the GIF…");
+    setNote(null);
+    try {
+      const clip = await decodeGif(file);
+      gifRef.current = clip;
+      setGifName(file.name);
+      setGifDelays(clip.delays);
+      setMode("gif");
+      setStart(0);
+      setHasPreview(false);
+      setMediaTick((n) => n + 1);
+      setResultUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setNote(clip.truncated ? `Using the first ${clip.duration.toFixed(1)}s of that GIF.` : null);
+    } catch (error) {
+      setNote(messageOf(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function onSourceFile(file: File) {
+    if (file.type === "image/gif" || /\.gif$/i.test(file.name)) {
+      void loadGif(file);
+      return;
+    }
+    setMode("reel");
+    void loadClip(file);
+  }
+
+  async function findGifs(query: string) {
+    setTenorBusy(true);
+    setNote(null);
+    try {
+      setTenorHits(await searchTenor({ data: { q: query } }));
+    } catch (error) {
+      setTenorHits([]);
+      setNote(messageOf(error));
+    } finally {
+      setTenorBusy(false);
+    }
+  }
+
+  async function pickTenor(hit: TenorHit) {
+    if (running || busy) return;
+    setTenorPick(hit.id);
+    setBusy("Fetching that GIF…");
+    setNote(null);
+    try {
+      let res = await fetch(hit.gifUrl);
+      if (!res.ok) res = await fetch(hit.previewUrl);
+      if (!res.ok) throw new Error("status");
+      const blob = await res.blob();
+      const safe = hit.title.replace(/[^\w\s-]+/g, "").trim().slice(0, 42) || "tenor";
+      await loadGif(new File([blob], `${safe}.gif`, { type: "image/gif" }));
+    } catch (error) {
+      setNote(messageOf(error));
+      setBusy(null);
+    }
+  }
+
+  async function loadPhoto(file: File) {
+    if (file.type === "image/gif" || /\.gif$/i.test(file.name)) {
+      setNote("That's the GIF. Drop it above, then add a still photo of your face.");
+      return;
+    }
     if (!file.type.startsWith("image/")) {
       setNote("Drop a photo — jpeg, png, or webp.");
       return;
@@ -200,7 +367,7 @@ export function Studio() {
       if (!type.startsWith("video/") && !/\.(mp4|webm|mov)(\?|$)/i.test(link)) {
         throw new Error("type");
       }
-      await useClip(new File([blob], "clip.mp4", { type }));
+      await loadClip(new File([blob], "clip.mp4", { type }));
     } catch {
       setHint("The browser couldn't read that link. Download the file and drop it instead.");
     } finally {
@@ -209,35 +376,61 @@ export function Studio() {
   }
 
   async function onRecast() {
-    const file = fileRef.current;
-    const video = sourceRef.current;
     const photo = photoRef.current;
-    if (!file || !video || !photo || running) return;
+    if (!photo || running) return;
     previewAbort.current?.abort();
     const ac = new AbortController();
     recastAbort.current = ac;
     setNote(null);
     setRun({ done: 0, total: 1, label: "Starting" });
     try {
-      const result = await recastClip({
-        file,
-        video,
-        photo,
-        photoToken,
-        flip,
-        follow: follow / 100,
-        lighting,
-        quality,
-        start,
-        signal: ac.signal,
-        onProgress: (info) => setRun(info),
-      });
-      const url = URL.createObjectURL(result.blob);
-      setResultUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return url;
-      });
-      setResultName(result.ext === "mp4" ? "recast.mp4" : "recast.webm");
+      if (mode === "gif") {
+        const gif = gifRef.current;
+        if (!gif) return;
+        const blob = await recastGif({
+          gif,
+          photo,
+          photoToken,
+          flip,
+          follow: follow / 100,
+          lighting,
+          quality,
+          start,
+          signal: ac.signal,
+          onProgress: (info) => setRun(info),
+        });
+        const url = URL.createObjectURL(blob);
+        setResultUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return url;
+        });
+        setResultName("recast.gif");
+        setResultKind("gif");
+      } else {
+        const file = fileRef.current;
+        const video = sourceRef.current;
+        if (!file || !video) return;
+        const result = await recastClip({
+          file,
+          video,
+          photo,
+          photoToken,
+          flip,
+          follow: follow / 100,
+          lighting,
+          quality,
+          start,
+          signal: ac.signal,
+          onProgress: (info) => setRun(info),
+        });
+        const url = URL.createObjectURL(result.blob);
+        setResultUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return url;
+        });
+        setResultName(result.ext === "mp4" ? "recast.mp4" : "recast.webm");
+        setResultKind("video");
+      }
       setHasPreview(true);
     } catch (error) {
       if (!isAbort(error)) setNote(messageOf(error));
@@ -257,10 +450,19 @@ export function Studio() {
     setHolding(true);
   }
 
-  const showSource = holding || (!resultUrl && !hasPreview && Boolean(clipName));
-  const showCanvas = hasPreview && !resultUrl && !holding;
+  const showSource = mode === "reel" && (holding || (!resultUrl && !hasPreview && Boolean(clipName)));
+  const showGif = mode === "gif" && (holding || (!resultUrl && !hasPreview && Boolean(gifName)));
+  const sourceReady = mode === "gif" ? Boolean(gifName) : Boolean(clipName);
+  const showCanvas = hasPreview && !resultUrl && !holding && sourceReady;
   const showResult = Boolean(resultUrl) && !holding;
-  const ready = Boolean(clipName && photoName && duration && !running);
+  const gifDuration = gifDelays.reduce((sum, delay) => sum + delay, 0) / 1000;
+  const activeDuration = mode === "gif" ? gifDuration : duration;
+  const gifSlice = mode === "gif" ? sliceGif(gifDelays, start) : null;
+  const span = mode === "gif" ? (gifSlice?.span ?? 0) : clipSpan(duration, start);
+  const ready =
+    mode === "gif"
+      ? Boolean(gifName && photoName && gifDelays.length && !running)
+      : Boolean(clipName && photoName && duration && !running);
 
   return (
     <div className="min-h-dvh bg-bg text-fg">
@@ -282,8 +484,8 @@ export function Studio() {
       <main className="mx-auto grid max-w-6xl gap-6 px-4 pb-16 lg:grid-cols-[minmax(0,1fr)_22rem]">
         <section className="order-2 flex flex-col gap-4 lg:order-1">
           <p className="max-w-xl text-base text-muted">
-            Drop a reel or short and a straight-on photo. Your real face is mapped onto the
-            largest face in the clip — the pixels stay yours.
+            Drop a reel, short, or GIF and a straight-on photo. Your real face is mapped onto the
+            largest face — the pixels stay yours.
           </p>
           <div className="overflow-hidden rounded-xl border border-border bg-surface">
             <div className="stage-frame relative mx-auto w-full max-w-md bg-bg">
@@ -295,13 +497,26 @@ export function Studio() {
                 preload="auto"
                 aria-hidden={!showSource}
               />
-              {clipName ? (
+              {sourceReady && mode === "gif" ? (
+                <canvas
+                  ref={gifViewRef}
+                  className={`absolute inset-0 h-full w-full object-contain ${showGif ? "opacity-100" : "opacity-0"}`}
+                />
+              ) : null}
+              {sourceReady ? (
                 <canvas
                   ref={stageRef}
                   className={`absolute inset-0 h-full w-full object-contain ${showCanvas ? "opacity-100" : "opacity-0"}`}
                 />
               ) : null}
-              {resultUrl ? (
+              {resultUrl && resultKind === "gif" ? (
+                <img
+                  className={`absolute inset-0 h-full w-full object-contain ${showResult ? "opacity-100" : "opacity-0"}`}
+                  src={resultUrl}
+                  alt="Recast GIF"
+                />
+              ) : null}
+              {resultUrl && resultKind === "video" ? (
                 <video
                   ref={resultRef}
                   className={`absolute inset-0 h-full w-full object-contain ${showResult ? "opacity-100" : "opacity-0"}`}
@@ -311,11 +526,13 @@ export function Studio() {
                   loop
                 />
               ) : null}
-              {!clipName ? (
+              {!sourceReady ? (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-8 text-center">
                   <Clapperboard className="size-8 text-muted" aria-hidden="true" />
                   <p className="font-display text-xl text-fg">The recast lands here</p>
-                  <p className="text-sm text-muted">A short with a clear face works best.</p>
+                  <p className="text-sm text-muted">
+                    {mode === "gif" ? "A GIF with a clear face works best." : "A short with a clear face works best."}
+                  </p>
                 </div>
               ) : null}
               {busy || running ? (
@@ -341,16 +558,115 @@ export function Studio() {
         </section>
 
         <aside className="order-1 flex flex-col gap-4 lg:order-2">
-          <DropZone
-            title="Reel or short"
-            detail="mp4, webm, or mov"
-            fileName={clipName}
-            accept="video/mp4,video/webm,video/quicktime,video/*"
-            icon={<Clapperboard className="size-5" aria-hidden="true" />}
-            inputId="clip-file"
-            disabled={running}
-            onFile={(file) => void useClip(file)}
-          />
+          <div className="grid grid-cols-2 gap-1 rounded-lg bg-surface p-1">
+            {(
+              [
+                ["reel", "Reel"],
+                ["gif", "GIF"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                aria-pressed={mode === id}
+                disabled={running}
+                onClick={() => {
+                  if (id === mode) return;
+                  setMode(id);
+                  setStart(0);
+                  setHasPreview(false);
+                  setNote(null);
+                  setResultUrl((prev) => {
+                    if (prev) URL.revokeObjectURL(prev);
+                    return null;
+                  });
+                  setMediaTick((n) => n + 1);
+                }}
+                className={`h-11 rounded-md text-sm ${mode === id ? "bg-surface-2 text-fg" : "text-muted"}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {mode === "reel" ? (
+            <DropZone
+              title="Reel or short"
+              detail="mp4, webm, mov, or gif"
+              fileName={clipName}
+              accept="video/mp4,video/webm,video/quicktime,video/*,image/gif,.gif"
+              icon={<Clapperboard className="size-5" aria-hidden="true" />}
+              inputId="clip-file"
+              disabled={running}
+              onFile={onSourceFile}
+            />
+          ) : (
+            <form
+              className="flex flex-col gap-2"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void findGifs(tenorQ);
+              }}
+            >
+              <label className="text-sm text-muted" htmlFor="tenor-q">
+                1. Search Tenor
+              </label>
+              <div className="flex gap-2">
+                <input
+                  id="tenor-q"
+                  type="search"
+                  value={tenorQ}
+                  disabled={running || Boolean(busy)}
+                  placeholder="wave, dance, hello"
+                  onChange={(event) => setTenorQ(event.target.value)}
+                  className="h-11 min-w-0 flex-1 rounded-lg border border-border bg-bg px-3 text-sm text-fg placeholder:text-muted"
+                />
+                <button
+                  type="submit"
+                  disabled={running || Boolean(busy) || tenorBusy}
+                  className="grid size-11 place-items-center rounded-lg border border-border bg-surface text-fg disabled:opacity-40"
+                >
+                  {tenorBusy ? (
+                    <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                  ) : (
+                    <Search className="size-4" aria-hidden="true" />
+                  )}
+                  <span className="sr-only">Search Tenor</span>
+                </button>
+              </div>
+              {tenorHits.length ? (
+                <ul className="grid max-h-52 grid-cols-3 gap-2 overflow-y-auto">
+                  {tenorHits.map((hit) => (
+                    <li key={hit.id}>
+                      <button
+                        type="button"
+                        disabled={running || Boolean(busy)}
+                        onClick={() => void pickTenor(hit)}
+                        className={`block w-full overflow-hidden rounded-lg border ${
+                          tenorPick === hit.id ? "border-primary" : "border-border"
+                        }`}
+                      >
+                        <img src={hit.previewUrl} alt={hit.title} className="h-20 w-full object-cover" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <p className="text-xs text-muted">GIFs from Tenor. Pick one with a clear face.</p>
+            </form>
+          )}
+          {mode === "gif" ? (
+            <DropZone
+              title="Or drop a GIF"
+              detail="Your own file"
+              fileName={gifName}
+              accept="image/gif,.gif"
+              icon={<Clapperboard className="size-5" aria-hidden="true" />}
+              inputId="clip-file"
+              disabled={running}
+              onFile={onSourceFile}
+            />
+          ) : null}
+          {mode === "reel" ? (
           <form className="flex flex-col gap-2" onSubmit={(event) => void onLinkSubmit(event)}>
             <label className="text-sm text-muted" htmlFor="clip-link">
               Or paste a direct video link
@@ -377,38 +693,43 @@ export function Studio() {
             </div>
             {hint ? <p className="text-sm text-muted">{hint}</p> : null}
           </form>
+          ) : null}
 
           <DropZone
-            title="Your photo"
+            title={mode === "gif" ? "2. Your photo" : "Your photo"}
             detail="Front-facing, eyes open"
             fileName={photoName}
             accept="image/jpeg,image/png,image/webp,image/*"
             icon={<ImagePlus className="size-5" aria-hidden="true" />}
             inputId="photo-file"
             disabled={running}
-            onFile={(file) => void usePhoto(file)}
+            onFile={(file) => void loadPhoto(file)}
           />
 
           <div className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-4">
             <label className="flex flex-col gap-1">
               <span className="flex items-center justify-between text-sm">
                 <span>Start</span>
-                <span className="tabular-nums text-muted">{duration ? clock(start) : "—"}</span>
+                <span className="tabular-nums text-muted">{activeDuration ? clock(start) : "—"}</span>
               </span>
               <input
                 type="range"
                 min={0}
-                max={Math.max(0, duration - 0.2)}
+                max={Math.max(0, activeDuration - (mode === "gif" ? 0 : 0.2))}
                 step={0.1}
-                value={Math.min(start, Math.max(0, duration))}
-                disabled={!duration || running}
+                value={Math.min(start, Math.max(0, activeDuration))}
+                disabled={!activeDuration || running}
                 onChange={(event) => setStart(Number(event.target.value))}
               />
             </label>
             <p className="text-sm text-muted">
-              {duration
-                ? `Recasts ${span.toFixed(1)}s from here. Cap is ${MAX_SECONDS}s.`
-                : "The first 12 seconds from the start point."}
+              {activeDuration
+                ? mode === "gif"
+                  ? `Recasts ${gifSlice?.delays.length ?? 0} frames (${span.toFixed(1)}s). Cap is ${MAX_GIF_SECONDS}s.`
+                  : `Recasts ${span.toFixed(1)}s from here. Cap is ${MAX_SECONDS}s.`
+                : mode === "gif"
+                  ? "The first 8 seconds from the start point."
+                  : "The first 12 seconds from the start point."}
             </p>
             <label className="flex flex-col gap-1">
               <span className="flex items-center justify-between text-sm">
@@ -425,7 +746,7 @@ export function Studio() {
               />
               <span className="flex justify-between text-xs text-muted">
                 <span>Your shape</span>
-                <span>Clip motion</span>
+                <span>Their motion</span>
               </span>
             </label>
             <div className="grid grid-cols-2 gap-2">
@@ -486,7 +807,7 @@ export function Studio() {
               onClick={() => void onRecast()}
               className="h-12 rounded-lg bg-primary text-sm font-medium text-primary-fg disabled:opacity-40"
             >
-              Make recast
+              {mode === "gif" ? "Make GIF" : "Make recast"}
             </button>
           )}
 
@@ -504,7 +825,7 @@ export function Studio() {
           <p className="flex gap-2 text-sm text-muted">
             <ShieldCheck className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
             <span>
-              Only your photo, and only clips you have the rights to remix. If several people are
+              Only your photo, and only clips or GIFs you have the rights to remix. If several people are
               in frame, the largest face is recast.
             </span>
           </p>

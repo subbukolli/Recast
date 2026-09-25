@@ -1,5 +1,6 @@
 import { RecastError, detectStill, detectVideo, fitFace, preparePhoto, type PhotoMesh } from "@/lib/faceswap/detect";
 import { openSink, readPcm } from "@/lib/faceswap/encode";
+import { encodeGif, gifSide, sliceGif, type GifClip } from "@/lib/faceswap/gif";
 import { QUALITY, clipSpan, targetSize, type Pt, type Quality } from "@/lib/faceswap/geometry";
 import { paintFace } from "@/lib/faceswap/warp";
 
@@ -330,4 +331,101 @@ export async function recastClip(opts: {
   }
   opts.onProgress({ done: total, total, label: "Wrapping the file" });
   return sink.finish();
+}
+
+export async function renderGifStill(opts: {
+  frame: HTMLCanvasElement;
+  photo: HTMLCanvasElement;
+  photoToken: string;
+  flip: boolean;
+  follow: number;
+  lighting: boolean;
+  quality: Quality;
+  output: HTMLCanvasElement;
+  signal: AbortSignal;
+}): Promise<"face" | "noface"> {
+  throwIfAborted(opts.signal);
+  const mesh = await meshFor(opts.photo, opts.flip, opts.photoToken);
+  throwIfAborted(opts.signal);
+  const { w, h } = targetSize(opts.frame.width, opts.frame.height, gifSide(opts.quality));
+  const { canvas, ctx } = work(w, h);
+  ctx.drawImage(opts.frame, 0, 0, w, h);
+  const landmarks = await detectStill(canvas);
+  const painted = composite({
+    ctx,
+    width: w,
+    height: h,
+    mesh,
+    landmarks,
+    follow: opts.follow,
+    lighting: opts.lighting,
+    state: { previous: null, missed: 0, mean: null },
+    hold: false,
+  });
+  opts.output.width = w;
+  opts.output.height = h;
+  const out = opts.output.getContext("2d");
+  if (!out) throw new RecastError("Couldn't show the preview.");
+  out.drawImage(canvas, 0, 0);
+  return painted ? "face" : "noface";
+}
+
+export async function recastGif(opts: {
+  gif: GifClip;
+  photo: HTMLCanvasElement;
+  photoToken: string;
+  flip: boolean;
+  follow: number;
+  lighting: boolean;
+  quality: Quality;
+  start: number;
+  signal: AbortSignal;
+  onProgress: (info: { done: number; total: number; label: string }) => void;
+}): Promise<Blob> {
+  throwIfAborted(opts.signal);
+  const slice = sliceGif(opts.gif.delays, opts.start);
+  const total = slice.delays.length;
+  if (!total) throw new RecastError("That GIF has no frames.");
+  opts.onProgress({ done: 0, total, label: "Reading your photo" });
+  const mesh = await meshFor(opts.photo, opts.flip, opts.photoToken);
+  throwIfAborted(opts.signal);
+  const { w, h } = targetSize(opts.gif.width, opts.gif.height, gifSide(opts.quality));
+  const { canvas, ctx } = work(w, h);
+  const state: PaintState = { previous: null, missed: 0, mean: null };
+  const rgba: Uint8ClampedArray[] = [];
+  let faced = 0;
+  for (let i = 0; i < total; i++) {
+    throwIfAborted(opts.signal);
+    const frame = opts.gif.frames[slice.startIndex + i];
+    if (!frame) break;
+    ctx.drawImage(frame, 0, 0, w, h);
+    const landmarks = await detectVideo(canvas);
+    if (
+      composite({
+        ctx,
+        width: w,
+        height: h,
+        mesh,
+        landmarks,
+        follow: opts.follow,
+        lighting: opts.lighting,
+        state,
+        hold: true,
+      })
+    ) {
+      faced += 1;
+    }
+    const shot = ctx.getImageData(0, 0, w, h);
+    rgba.push(shot.data);
+    if (i % 2 === 0 || i === total - 1) {
+      opts.onProgress({ done: i + 1, total, label: "Recasting GIF" });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  if (faced < Math.min(3, rgba.length)) {
+    throw new RecastError("No face in that GIF. Use one with a clear, front-facing face.");
+  }
+  opts.onProgress({ done: total, total, label: "Wrapping the GIF" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  return encodeGif(rgba, w, h, slice.delays.slice(0, rgba.length));
 }
